@@ -1,95 +1,79 @@
-import os
-import asyncio
-import logging
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
+import os, logging
+import httpx
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
 
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("client")
 
-load_dotenv()
+SERVER_URL = os.getenv("MCP_SERVER_URL", "http://localhost:8000")
+CLIENT_ID = os.getenv("MCP_CLIENT_ID", "mcp-client")
+CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET", "mcp-secret")
 API_KEY = os.getenv("GEMINI_API_KEY")
 MODEL = "gemini-2.5-flash"
 
-# How to launch the server: run "python server.py"
-server_params = StdioServerParameters(command="python", args=["server.py"])
+
+async def get_token() -> str:
+    """Authenticate to the server and return a JWT (step 1: must happen before any tool access)."""
+    async with httpx.AsyncClient() as http:
+        r = await http.post(f"{SERVER_URL}/token",
+                            data={"username": CLIENT_ID, "password": CLIENT_SECRET})
+        r.raise_for_status()
+        logger.info("Authenticated with server; token acquired.")
+        return r.json()["access_token"]
 
 
 def build_gemini_tools(mcp_tools):
-    """Convert the MCP server's tool list into Gemini function declarations."""
-    declarations = [
-        types.FunctionDeclaration(
-            name=t.name,
-            description=t.description or "",
-            parameters_json_schema=t.inputSchema,
-        )
-        for t in mcp_tools
-    ]
-    return [types.Tool(function_declarations=declarations)]
+    decls = [types.FunctionDeclaration(name=t.name, description=t.description or "",
+                                       parameters_json_schema=t.inputSchema) for t in mcp_tools]
+    return [types.Tool(function_declarations=decls)]
 
 
-async def ask(gemini, session, gemini_tools, prompt):
-    """Send one prompt, run any tools Gemini asks for, return the final text answer."""
-    contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
-    config = types.GenerateContentConfig(
-        tools=gemini_tools,
-        temperature=0,
-        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-    )
-
-    for _ in range(5):  # safety cap on tool-call rounds
-        response = await gemini.aio.models.generate_content(
-            model=MODEL, contents=contents, config=config
-        )
-
-        calls = response.function_calls
-        if not calls:
-            return response.text
-
-        # Record Gemini's request, then run each tool against the MCP server
-        contents.append(response.candidates[0].content)
-        tool_parts = []
-        for call in calls:
-            logger.info("Gemini requested tool: %s(%s)", call.name, dict(call.args))
-            result = await session.call_tool(call.name, dict(call.args))
-            result_text = result.content[0].text if result.content else ""
-            tool_parts.append(
-                types.Part.from_function_response(
-                    name=call.name, response={"result": result_text}
-                )
-            )
-        contents.append(types.Content(role="user", parts=tool_parts))
-
-    return response.text
-
-
-async def main():
-    if not API_KEY:
-        print("ERROR: GEMINI_API_KEY not found. Create a .env file with GEMINI_API_KEY=your_key")
-        return
-
-    gemini = genai.Client(api_key=API_KEY)
-
-    async with stdio_client(server_params) as (read, write):
+async def run_query(prompt: str) -> str:
+    token = await get_token()                       # 1. authenticate FIRST
+    headers = {"Authorization": f"Bearer {token}"}  # 2. present token on every MCP call
+    async with streamablehttp_client(f"{SERVER_URL}/mcp", headers=headers) as (read, write, _):
         async with ClientSession(read, write) as session:
-            await session.initialize()
+            await session.initialize()              # 3. MCP handshake (rejected if token invalid)
             tool_list = await session.list_tools()
             gemini_tools = build_gemini_tools(tool_list.tools)
-            logger.info("Connected. %d tools available to Gemini.", len(tool_list.tools))
+            gemini = genai.Client(api_key=API_KEY)
 
-            print("\nTask assistant ready. Ask me about your tasks. Type 'quit' to exit.\n")
-            while True:
-                prompt = input("You: ").strip()
-                if prompt.lower() in {"quit", "exit"}:
-                    break
-                if not prompt:
-                    continue
-                answer = await ask(gemini, session, gemini_tools, prompt)
-                print(f"\nAssistant: {answer}\n")
+            contents = [types.Content(role="user", parts=[types.Part(text=prompt)])]
+            config = types.GenerateContentConfig(
+                tools=gemini_tools, temperature=0,
+                automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True))
+            for _ in range(5):
+                resp = await gemini.aio.models.generate_content(model=MODEL, contents=contents, config=config)
+                calls = resp.function_calls
+                if not calls:
+                    return resp.text
+                contents.append(resp.candidates[0].content)
+                parts = []
+                for call in calls:
+                    logger.info("Gemini requested tool: %s(%s)", call.name, dict(call.args))
+                    result = await session.call_tool(call.name, dict(call.args))
+                    txt = result.content[0].text if result.content else ""
+                    parts.append(types.Part.from_function_response(name=call.name, response={"result": txt}))
+                contents.append(types.Content(role="user", parts=parts))
+            return resp.text
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+app = FastAPI(title="Task Assistant Client")
+
+class ChatIn(BaseModel):
+    message: str
+
+@app.post("/chat")
+async def chat(body: ChatIn):
+    try:
+        return {"answer": await run_query(body.message)}
+    except Exception as e:
+        logger.exception("chat failed")
+        raise HTTPException(status_code=500, detail=str(e))
