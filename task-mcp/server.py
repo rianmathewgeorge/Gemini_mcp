@@ -1,162 +1,138 @@
-import sqlite3
-import logging
+import os, sqlite3, logging, datetime
 from pathlib import Path
-from mcp.server.fastmcp import FastMCP
+from contextlib import asynccontextmanager
 
+import jwt
+from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from fastapi.security import OAuth2PasswordRequestForm
+from mcp.server.fastmcp import FastMCP
+from dotenv import load_dotenv
+
+load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("server")
 
 DB_PATH = Path(__file__).parent / "tasks.db"
+JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret-change-me")
+JWT_ALGO = "HS256"
+TOKEN_TTL_MIN = 30
+CLIENT_ID = os.getenv("MCP_CLIENT_ID", "mcp-client")
+CLIENT_SECRET = os.getenv("MCP_CLIENT_SECRET", "mcp-secret")
 
 ALLOWED_STATUSES = {"Open", "In Progress", "Completed"}
 ALLOWED_PRIORITIES = {"Low", "Medium", "High"}
 
-mcp = FastMCP("task-manager")
-
+mcp = FastMCP("task-manager", stateless_http=True)
+mcp.settings.streamable_http_path = "/"
 
 def get_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row; return conn
 
 @mcp.tool()
 def get_task(task_id: int) -> dict:
-    """Retrieve a single task by its ID.
-
-    Args:
-        task_id: The unique integer ID of the task to fetch.
-    """
-    logger.info("get_task called with task_id=%s", task_id)
+    """Retrieve a single task by its ID."""
+    logger.info("get_task task_id=%s", task_id)
     conn = get_connection()
     try:
-        row = conn.execute(
-            "SELECT id, title, description, status, priority, created_at FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
+        row = conn.execute("SELECT id,title,description,status,priority,created_at FROM tasks WHERE id=?", (task_id,)).fetchone()
     finally:
         conn.close()
-
-    if row is None:
-        logger.info("get_task: no task found with id=%s", task_id)
-        return {"error": f"No task found with id {task_id}"}
-
-    logger.info("get_task: found task id=%s", task_id)
-    return dict(row)
-
+    return dict(row) if row else {"error": f"No task with id {task_id}"}
 
 @mcp.tool()
 def search_tasks(status: str | None = None, priority: str | None = None) -> dict:
-    """Search for tasks, optionally filtering by status and/or priority.
-
-    Args:
-        status: Optional status filter. One of 'Open', 'In Progress', 'Completed'.
-        priority: Optional priority filter. One of 'Low', 'Medium', 'High'.
-    """
-    logger.info("search_tasks called with status=%s priority=%s", status, priority)
-
-    # 1. Validate inputs before touching the database
-    if status is not None and status not in ALLOWED_STATUSES:
-        logger.info("search_tasks: rejected invalid status=%s", status)
-        return {"error": f"Invalid status '{status}'. Must be one of {sorted(ALLOWED_STATUSES)}"}
-    if priority is not None and priority not in ALLOWED_PRIORITIES:
-        logger.info("search_tasks: rejected invalid priority=%s", priority)
-        return {"error": f"Invalid priority '{priority}'. Must be one of {sorted(ALLOWED_PRIORITIES)}"}
-
-    # 2. Build the WHERE clause dynamically, but safely
-    conditions = []
-    params = []
-    if status is not None:
-        conditions.append("status = ?")
-        params.append(status)
-    if priority is not None:
-        conditions.append("priority = ?")
-        params.append(priority)
-
-    query = "SELECT id, title, description, status, priority, created_at FROM tasks"
-    if conditions:
-        query += " WHERE " + " AND ".join(conditions)
-    query += " ORDER BY created_at DESC"
-
-    # 3. Run it and convert every row to a dict
+    """Search tasks, optionally filtering by status and/or priority."""
+    logger.info("search_tasks status=%s priority=%s", status, priority)
+    if status and status not in ALLOWED_STATUSES:
+        return {"error": f"Invalid status '{status}'"}
+    if priority and priority not in ALLOWED_PRIORITIES:
+        return {"error": f"Invalid priority '{priority}'"}
+    cond, params = [], []
+    if status: cond.append("status=?"); params.append(status)
+    if priority: cond.append("priority=?"); params.append(priority)
+    q = "SELECT id,title,description,status,priority,created_at FROM tasks"
+    if cond: q += " WHERE " + " AND ".join(cond)
+    q += " ORDER BY created_at DESC"
     conn = get_connection()
     try:
-        rows = conn.execute(query, params).fetchall()
+        rows = conn.execute(q, params).fetchall()
     finally:
         conn.close()
-
-    tasks = [dict(row) for row in rows]
-    logger.info("search_tasks: found %d tasks", len(tasks))
+    tasks = [dict(r) for r in rows]
     return {"count": len(tasks), "tasks": tasks}
 
-
 @mcp.tool()
-def create_task(title: str, description: str | None = None,
-                status: str = "Open", priority: str = "Medium") -> dict:
-    """Create a new task and return its generated ID.
-
-    Args:
-        title: The task title (required, cannot be empty).
-        description: Optional longer description of the task.
-        status: Task status. One of 'Open', 'In Progress', 'Completed'. Defaults to 'Open'.
-        priority: Task priority. One of 'Low', 'Medium', 'High'. Defaults to 'Medium'.
-    """
-    logger.info("create_task called with title=%r status=%s priority=%s", title, status, priority)
-
-    # Validate every input before writing
+def create_task(title: str, description: str | None = None, status: str = "Open", priority: str = "Medium") -> dict:
+    """Create a new task and return its generated ID."""
+    logger.info("create_task title=%r", title)
     if not title or not title.strip():
-        logger.info("create_task: rejected empty title")
-        return {"success": False, "error": "Title is required and cannot be empty."}
+        return {"success": False, "error": "Title is required."}
     if status not in ALLOWED_STATUSES:
-        logger.info("create_task: rejected invalid status=%s", status)
-        return {"success": False, "error": f"Invalid status '{status}'. Must be one of {sorted(ALLOWED_STATUSES)}"}
+        return {"success": False, "error": f"Invalid status '{status}'"}
     if priority not in ALLOWED_PRIORITIES:
-        logger.info("create_task: rejected invalid priority=%s", priority)
-        return {"success": False, "error": f"Invalid priority '{priority}'. Must be one of {sorted(ALLOWED_PRIORITIES)}"}
-
+        return {"success": False, "error": f"Invalid priority '{priority}'"}
     conn = get_connection()
     try:
-        cursor = conn.execute(
-            "INSERT INTO tasks (title, description, status, priority) VALUES (?, ?, ?, ?)",
-            (title.strip(), description, status, priority),
-        )
-        conn.commit()
-        new_id = cursor.lastrowid
+        cur = conn.execute("INSERT INTO tasks (title,description,status,priority) VALUES (?,?,?,?)",
+                           (title.strip(), description, status, priority))
+        conn.commit(); new_id = cur.lastrowid
     finally:
         conn.close()
-
-    logger.info("create_task: created task id=%s", new_id)
     return {"success": True, "task_id": new_id}
-
 
 @mcp.tool()
 def task_statistics() -> dict:
-    """Return summary statistics about all tasks: the total count and a
-    breakdown of how many tasks are in each status."""
-    logger.info("task_statistics called")
+    """Return total task count and a breakdown by status."""
+    logger.info("task_statistics")
     conn = get_connection()
     try:
         total = conn.execute("SELECT COUNT(*) AS n FROM tasks").fetchone()["n"]
-        rows = conn.execute(
-            "SELECT status, COUNT(*) AS n FROM tasks GROUP BY status"
-        ).fetchall()
+        rows = conn.execute("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").fetchall()
     finally:
         conn.close()
+    counts = {s: 0 for s in ALLOWED_STATUSES}
+    for r in rows: counts[r["status"]] = r["n"]
+    return {"total_tasks": total, "open_tasks": counts["Open"],
+            "in_progress_tasks": counts["In Progress"], "completed_tasks": counts["Completed"]}
 
-    # Start every allowed status at 0 so a status with no tasks still appears.
-    counts = {status: 0 for status in ALLOWED_STATUSES}
-    for row in rows:
-        counts[row["status"]] = row["n"]
+# ---------------- Auth ----------------
+def create_token() -> str:
+    exp = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(minutes=TOKEN_TTL_MIN)
+    return jwt.encode({"sub": CLIENT_ID, "exp": exp}, JWT_SECRET, algorithm=JWT_ALGO)
 
-    result = {
-        "total_tasks": total,
-        "open_tasks": counts["Open"],
-        "in_progress_tasks": counts["In Progress"],
-        "completed_tasks": counts["Completed"],
-    }
-    logger.info("task_statistics: %s", result)
-    return result
+def verify_bearer(request: Request):
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    try:
+        jwt.decode(auth.split(" ", 1)[1], JWT_SECRET, algorithms=[JWT_ALGO])
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
+@asynccontextmanager
+async def lifespan(app):
+    async with mcp.session_manager.run():
+        yield
 
-if __name__ == "__main__":
-    mcp.run()
+app = FastAPI(title="Task MCP Server", lifespan=lifespan)
+
+@app.post("/token")
+def issue_token(form: OAuth2PasswordRequestForm = Depends()):
+    if form.username != CLIENT_ID or form.password != CLIENT_SECRET:
+        logger.info("Auth FAILED for %s", form.username)
+        raise HTTPException(status_code=401, detail="Invalid client credentials")
+    logger.info("Token issued to %s", form.username)
+    return {"access_token": create_token(), "token_type": "bearer"}
+
+@app.middleware("http")
+async def gate_mcp(request: Request, call_next):
+    if request.url.path.startswith("/mcp"):
+        try:
+            verify_bearer(request)
+        except HTTPException as e:
+            logger.info("Blocked unauthenticated MCP request: %s", e.detail)
+            return JSONResponse({"detail": e.detail}, status_code=e.status_code)
+    return await call_next(request)
+
+app.mount("/mcp", mcp.streamable_http_app())
